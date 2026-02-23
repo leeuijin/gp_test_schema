@@ -9,7 +9,17 @@
 -- 모든 Fact는 lot_id 기준 분산
 -- Raw Material도 LOT 단위 입고/사용 이력 분리
 -- 모든 대용량 테이블은 AO Columnar + ZSTD
-
+/*
+customers: 출하 고객사 마스터 테이블
+equipment: 생산 설비 마스터 테이블
+equipment_log: LOT 생산 중 설비 이벤트 로그 테이블 (대용량 시계열 데이터)
+lot_material_usage: LOT별 원자재 사용 이력 테이블 (Traceability 핵심)
+production_lot: 생산 LOT 기본 정보 테이블 (MES 중심 테이블)
+products: 배터리 제품 마스터 테이블 (셀/모듈/팩)
+quality_inspection: LOT 품질 검사 결과 테이블
+raw_materials: 원자재 마스터 테이블
+shipments: LOT 출하 정보 테이블
+*/
 
 -- ==========================================================================
 -- #Dimension 테이블 (상대적으로 작음 → Row AO 유지 가능)
@@ -423,6 +433,9 @@ JOIN quality_inspection qi
 ON pl.lot_id = qi.lot_id
 WHERE pl.lot_id = 100;
 
+GRANT CONNECT ON DATABASE kbc TO gpadmin;
+GRANT ALL PRIVILEGES ON SCHEMA public TO gpadmin;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO gpadmin;
 
 kbc=# \dt
                              List of relations
