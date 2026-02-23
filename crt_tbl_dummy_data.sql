@@ -1,0 +1,381 @@
+✔ LOT 기반 완전 Traceability
+✔ Motion 최소화
+✔ AO Columnar + ZSTD 압축 (level 7)
+✔ 실제 MES 운영에 가까운 구조
+
+MES는 “제품 분석”이 아니라 추적 검사 및 이력확인이 핵심(역추적 / 순추적이 핵심)
+특정 LOT → 원자재 → 설비 → 검사 → 출하 
+
+모든 Fact는 lot_id 기준 분산
+Raw Material도 LOT 단위 입고/사용 이력 분리
+모든 대용량 테이블은 AO Columnar + ZSTD
+
+
+==========================================================================
+#Dimension 테이블 (상대적으로 작음 → Row AO 유지 가능)
+==========================================================================
+
+CREATE TABLE products (
+    product_id INT,
+    product_name VARCHAR(100),
+    product_type VARCHAR(20),
+    capacity_mah INT,
+    voltage NUMERIC(6,2)
+)
+DISTRIBUTED BY (product_id);
+
+CREATE TABLE equipment (
+    equipment_id INT,
+    equipment_name VARCHAR(100),
+    line_name VARCHAR(50)
+)
+DISTRIBUTED BY (equipment_id);
+
+CREATE TABLE customers (
+    customer_id INT,
+    customer_name VARCHAR(100),
+    country VARCHAR(50)
+)
+DISTRIBUTED BY (customer_id);
+
+CREATE TABLE raw_materials (
+    material_id INT,
+    material_name VARCHAR(100),
+    supplier_name VARCHAR(100)
+)
+DISTRIBUTED BY (material_id);
+
+==========================================================================
+#Fact 테이블
+==========================================================================
+
+CREATE TABLE production_lot (
+    lot_id BIGINT,
+    lot_number VARCHAR(50),
+    product_id INT,
+    equipment_id INT,
+    production_date DATE,
+    quantity INT,
+    status VARCHAR(20)
+)
+WITH (
+    appendoptimized=true,
+    orientation=column,
+    compresstype=zstd,
+    compresslevel=7
+)
+DISTRIBUTED BY (lot_id)
+PARTITION BY RANGE (production_date)
+(
+    START ('2026-01-01') END ('2026-12-31') EVERY (INTERVAL '1 month')
+);
+
+-- LOT별 원자재 사용
+CREATE TABLE lot_material_usage (
+    id BIGINT,
+    lot_id BIGINT,
+    material_id INT,
+    material_lot_no VARCHAR(50),
+    quantity_used NUMERIC(10,2)
+)
+WITH (
+    appendoptimized=true,
+    orientation=column,
+    compresstype=zstd,
+    compresslevel=7
+)
+DISTRIBUTED BY (lot_id);
+
+-- 품질 검사 테이블
+
+CREATE TABLE quality_inspection (
+    inspection_id BIGINT,
+    lot_id BIGINT,
+    inspection_time TIMESTAMP,
+    test_type VARCHAR(50),
+    result VARCHAR(20),
+    defect_rate NUMERIC(5,2)
+)
+WITH (
+    appendoptimized=true,
+    orientation=column,
+    compresstype=zstd,
+    compresslevel=7
+)
+DISTRIBUTED BY (lot_id);
+
+-- 설비 로그 (MES 핵심 대용량)
+
+CREATE TABLE equipment_log (
+    log_id BIGINT,
+    lot_id BIGINT,
+    equipment_id INT,
+    event_time TIMESTAMP,
+    temperature NUMERIC(5,2),
+    pressure NUMERIC(5,2),
+    status VARCHAR(20)
+)
+WITH (
+    appendoptimized=true,
+    orientation=column,
+    compresstype=zstd,
+    compresslevel=7
+)
+DISTRIBUTED BY (lot_id);
+
+-- 출하
+
+CREATE TABLE shipments (
+    shipment_id BIGINT,
+    lot_id BIGINT,
+    customer_id INT,
+    shipment_date DATE,
+    quantity INT
+)
+WITH (
+    appendoptimized=true,
+    orientation=column,
+    compresstype=zstd,
+    compresslevel=7
+)
+DISTRIBUTED BY (lot_id);
+
+
+==========================================================================
+테스트 더미 데이터 생성
+==========================================================================
+
+INSERT INTO products
+SELECT 
+    i,
+    'Battery_Model_'||i,
+    CASE WHEN i%3=0 THEN 'CELL'
+         WHEN i%3=1 THEN 'MODULE'
+         ELSE 'PACK' END,
+    3000 + i*500,
+    3.7 + (i*0.1)
+FROM generate_series(1,10) i;
+
+INSERT INTO equipment
+SELECT 
+    i,
+    'Equipment_'||i,
+    'Line_'||(i%3+1)
+FROM generate_series(1,5) i;
+
+INSERT INTO customers
+SELECT 
+    i,
+    'Customer_'||i,
+    CASE WHEN i%3=0 THEN 'USA'
+         WHEN i%3=1 THEN 'Korea'
+         ELSE 'Germany' END
+FROM generate_series(1,10) i;
+
+INSERT INTO raw_materials
+SELECT 
+    i,
+    'Material_'||i,
+    'Supplier_'||((i%5)+1)
+FROM generate_series(1,20) i;
+
+INSERT INTO production_lot
+SELECT 
+    gs AS lot_id,
+    'LOT-'||to_char(gs,'FM000000') AS lot_number,
+    (random()*9+1)::int AS product_id,
+    (random()*4+1)::int AS equipment_id,
+    DATE '2026-01-01' + (random()*180)::int AS production_date,
+    (random()*9000+1000)::int AS quantity,
+    CASE WHEN random() < 0.92 THEN 'COMPLETED'
+         WHEN random() < 0.97 THEN 'IN_PROGRESS'
+         ELSE 'SCRAPPED' END
+FROM generate_series(1,5000) gs;
+
+--LOT당 평균 3건 → 약 15,000건
+
+INSERT INTO lot_material_usage
+SELECT 
+    row_number() OVER() AS id,
+    pl.lot_id,
+    (random()*19+1)::int AS material_id,
+    'MATLOT-'||to_char(pl.lot_id,'FM000000')||'-'||gs,
+    round((random()*500+50)::numeric, 2)
+FROM production_lot pl,
+     generate_series(1,3) gs;
+
+-- LOT당 1~2건 → 약 7500건
+
+INSERT INTO quality_inspection
+SELECT 
+    row_number() OVER() AS inspection_id,
+    pl.lot_id,
+    pl.production_date + (random()*3)::int,
+    CASE WHEN random() < 0.7 THEN 'Voltage Test'
+         ELSE 'Charge/Discharge Test' END,
+    CASE WHEN random() < 0.95 THEN 'PASS'
+         ELSE 'FAIL' END,
+    round((random()*3)::numeric,2)
+FROM production_lot pl,
+     generate_series(1,2);
+
+-- LOT당 10건 → 50,000건 (MES 시뮬레이션용) 
+
+INSERT INTO equipment_log
+SELECT 
+    row_number() OVER() AS log_id,
+    pl.lot_id,
+    pl.equipment_id,
+    pl.production_date + (gs || ' minutes')::interval,
+    round((20 + random()*15)::numeric,2),
+    round((1 + random()*5)::numeric,2),
+    CASE WHEN random() < 0.98 THEN 'NORMAL'
+         ELSE 'ALERT' END
+FROM production_lot pl,
+     generate_series(1,10) gs;
+
+-- 약 70% 출하 → ~3500건
+
+INSERT INTO shipments
+SELECT 
+    pl.lot_id AS shipment_id,
+    pl.lot_id,
+    (random()*9+1)::int,
+    pl.production_date + 2,
+    (pl.quantity*0.8)::int
+FROM production_lot pl
+WHERE random() < 0.7;
+
+-- SKEW 확인
+
+SELECT gp_segment_id, count(*)
+FROM production_lot
+GROUP BY 1
+ORDER BY 1;
+
+ANALYZE production_lot;
+ANALYZE lot_material_usage;
+ANALYZE quality_inspection;
+ANALYZE equipment_log;
+ANALYZE shipments;
+
+| 테이블                | 예상 건수  |
+| ------------------ | ------ |
+| production_lot     | 5,000  |
+| lot_material_usage | 15,000 |
+| quality_inspection | ~7,500 |
+| equipment_log      | 50,000 |
+| shipments          | ~3,500 |
+
+
+==========================================================================
+수행 예제
+==========================================================================
+
+-- 특정 LOT 전체 이력 조회 (순추적)
+
+SELECT 
+    pl.lot_number,
+    pl.production_date,
+    p.product_name,
+    e.equipment_name,
+    qi.result,
+    qi.defect_rate,
+    s.shipment_date,
+    c.customer_name
+FROM production_lot pl
+LEFT JOIN products p ON pl.product_id = p.product_id
+LEFT JOIN equipment e ON pl.equipment_id = e.equipment_id
+LEFT JOIN quality_inspection qi ON pl.lot_id = qi.lot_id
+LEFT JOIN shipments s ON pl.lot_id = s.lot_id
+LEFT JOIN customers c ON s.customer_id = c.customer_id
+WHERE pl.lot_number = 'LOT-000123';
+
+-- 원자재 역추적 (문제 발생 시) 
+-- 특정 LOT에서 사용된 원자재 LOT 조회
+
+SELECT 
+    pl.lot_number,
+    rm.material_name,
+    lmu.material_lot_no,
+    lmu.quantity_used
+FROM production_lot pl
+JOIN lot_material_usage lmu ON pl.lot_id = lmu.lot_id
+JOIN raw_materials rm ON lmu.material_id = rm.material_id
+WHERE pl.lot_number = 'LOT-000123';
+
+-- 특정 원자재 LOT가 사용된 모든 생산 LOT 찾기 (역방향)
+
+SELECT 
+    pl.lot_number,
+    pl.production_date,
+    pl.status
+FROM lot_material_usage lmu
+JOIN production_lot pl ON lmu.lot_id = pl.lot_id
+WHERE lmu.material_lot_no = 'MATLOT-000123-1';
+
+-- LOT 기반 설비 상태 추적
+
+SELECT 
+    event_time,
+    temperature,
+    pressure,
+    status
+FROM equipment_log
+WHERE lot_id = 123
+ORDER BY event_time;
+
+==========================================================================
+튜닝 포인트
+==========================================================================
+
+-- Compression 효과 확인
+
+SELECT relname,
+       pg_size_pretty(pg_total_relation_size(oid))
+FROM pg_class
+WHERE relname = 'production_lot';
+
+-- Motion 확인
+
+EXPLAIN ANALYZE
+SELECT *
+FROM production_lot pl
+JOIN quality_inspection qi
+ON pl.lot_id = qi.lot_id
+WHERE pl.lot_id = 100;
+
+
+kbc=# \dt
+                             List of relations
+ Schema |          Name           | Type  |  Owner  |       Storage
+--------+-------------------------+-------+---------+----------------------
+ public | customers               | table | gpadmin | heap
+ public | equipment               | table | gpadmin | heap
+ public | equipment_log           | table | gpadmin | append only columnar
+ public | lot_material_usage      | table | gpadmin | append only columnar
+ public | production_lot          | table | gpadmin | append only columnar
+ public | production_lot_1_prt_1  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_10 | table | gpadmin | append only columnar
+ public | production_lot_1_prt_11 | table | gpadmin | append only columnar
+ public | production_lot_1_prt_12 | table | gpadmin | append only columnar
+ public | production_lot_1_prt_2  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_3  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_4  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_5  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_6  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_7  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_8  | table | gpadmin | append only columnar
+ public | production_lot_1_prt_9  | table | gpadmin | append only columnar
+ public | products                | table | gpadmin | heap
+ public | quality_inspection      | table | gpadmin | append only columnar
+ public | raw_materials           | table | gpadmin | heap
+ public | shipments               | table | gpadmin | append only columnar
+(21 rows)
+
+
+
+
+
+
+
